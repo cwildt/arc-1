@@ -376,7 +376,9 @@ export async function run(argv: string[] = process.argv.slice(2)): Promise<void>
     }
 
     const cookieFileContent = toNetscapeCookieFile(cookies);
-    mkdirSync(dirname(plan.outputPath), { recursive: true });
+    // On Windows, recursive mkdir on an existing drive root (e.g. C:\) throws EPERM.
+    const outputDir = dirname(plan.outputPath);
+    if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
     writeFileSync(plan.outputPath, cookieFileContent, { encoding: 'utf-8', mode: 0o600 });
     chmodSync(plan.outputPath, 0o600);
 
