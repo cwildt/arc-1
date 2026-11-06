@@ -427,6 +427,11 @@ What it does:
 3. Return to the terminal and press Enter. The script then reads the SAP session cookies (`SAP_SESSIONID_*`, `MYSAPSSO2`, `sap-usercontext`) out of Chrome.
 4. Writes them to `cookies.txt` with mode `0600`.
 
+Optional flags:
+
+- `--auto` — skip the Enter prompt. The extractor polls the browser and captures as soon as SAP accepts the cookies in a plain request to `/sap/bc/adt/discovery` (no browser, no client certificate). If the login relies on per-request authentication such as X.509 client certificates, SAP never accepts the cookies and the run times out after five minutes instead of writing a file that would later return 401.
+- `--profile-dir <path>` — reuse a persistent browser profile, so the IdP session survives and later logins are faster. Keep the directory private; it holds your browser session.
+
 Then point ARC-1 at the cookie file:
 
 ```bash

@@ -11,6 +11,8 @@ type BrowserChoice = 'chrome' | 'firefox' | 'edge';
 interface ScriptArgs {
   browser: BrowserChoice;
   output?: string;
+  profileDir?: string;
+  auto: boolean;
   yes: boolean;
   help: boolean;
 }
@@ -33,6 +35,8 @@ export interface ExtractionPlan {
   browser: BrowserChoice;
   browserBinary: string;
   outputPath: string;
+  profileDir?: string;
+  auto: boolean;
   yes: boolean;
 }
 
@@ -73,6 +77,8 @@ function parseScriptArgs(args: string[]): ScriptArgs {
   return {
     browser,
     output: getFlag(args, 'output'),
+    profileDir: getFlag(args, 'profile-dir'),
+    auto: args.includes('--auto'),
     yes: args.includes('--yes'),
     help: args.includes('--help') || args.includes('-h'),
   };
@@ -163,6 +169,9 @@ Options:
   --url <url>               Target SAP URL (required). Precedence: CLI > env > .env
   --browser <name>          Browser to launch: chrome | firefox | edge (default: chrome)
   --output <path>           Output cookie file path. Precedence: CLI > SAP_COOKIE_FILE env > ./cookies.txt
+  --auto                    Do not wait for Enter: capture as soon as the cookies are accepted by SAP
+                            (checked with a cookie-only request to /sap/bc/adt/discovery)
+  --profile-dir <path>      Persistent browser profile (keeps the IdP session, so later logins are faster)
   --yes                     Skip the DEV-ONLY confirmation prompt
   --help, -h                Show this help
 `);
@@ -301,6 +310,41 @@ async function fetchCookiesViaCdp(wsUrl: string, origin: string): Promise<CdpCoo
   });
 }
 
+export function buildCookieHeader(cookies: CdpCookie[]): string {
+  return cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+}
+
+// Checks the cookies the way ARC-1 will use them: outside the browser, without client certificates or Windows SSO.
+async function sapAcceptsCookies(origin: string, cookies: CdpCookie[]): Promise<boolean> {
+  try {
+    const response = await fetch(`${origin}/sap/bc/adt/discovery`, {
+      headers: { Cookie: buildCookieHeader(cookies), Accept: 'application/atomsvc+xml' },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15_000),
+    });
+    return response.status === 200 && (response.headers.get('content-type') ?? '').includes('xml');
+  } catch {
+    return false;
+  }
+}
+
+async function waitForAcceptedCookies(wsUrl: string, origin: string, timeoutMs = 300_000): Promise<CdpCookie[]> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const cookies = await fetchCookiesViaCdp(wsUrl, origin);
+      if (cookies.length > 0 && (await sapAcceptsCookies(origin, cookies))) return cookies;
+    } catch {
+      // Browser still starting or navigating; retry.
+    }
+    await delay(2000);
+  }
+  throw new Error(
+    `SAP did not accept the browser cookies for ${origin} within ${timeoutMs / 1000}s. ` +
+      'The login may use client-certificate or other per-request authentication that cookies cannot carry.',
+  );
+}
+
 export function formatNetscapeCookieLine(cookie: CdpCookie): string {
   const domain = cookie.domain || '';
   const includeSubdomains = domain.startsWith('.') ? 'TRUE' : 'FALSE';
@@ -338,6 +382,8 @@ export function planExtraction(input: ExtractionPlanInput): ExtractionPlan {
     browser: scriptArgs.browser,
     browserBinary,
     outputPath: resolve(input.cwd, scriptArgs.output ?? serverArgs.cookieFile ?? './cookies.txt'),
+    profileDir: scriptArgs.profileDir ? resolve(input.cwd, scriptArgs.profileDir) : undefined,
+    auto: scriptArgs.auto,
     yes: scriptArgs.yes,
   };
 }
@@ -360,17 +406,25 @@ export async function run(argv: string[] = process.argv.slice(2)): Promise<void>
   await maybePromptConfirmation(plan.yes);
 
   const port = 9222;
-  const profileDir = mkdtempSync(join(tmpdir(), 'arc1-cookie-extract-'));
+  const profileDir = plan.profileDir ?? mkdtempSync(join(tmpdir(), 'arc1-cookie-extract-'));
+  if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true });
   const browserProcess = startBrowser(plan.browserBinary, plan.browser, plan.url, port, profileDir);
 
   try {
     const wsUrl = await waitForDebuggerWebSocketUrl(port);
-    process.stderr.write(
-      `Browser started (${plan.browser}). Complete login for ${plan.origin}, then press Enter to capture cookies.\n`,
-    );
-    await waitForEnter('');
-
-    const cookies = await fetchCookiesViaCdp(wsUrl, plan.origin);
+    let cookies: CdpCookie[];
+    if (plan.auto) {
+      process.stderr.write(
+        `Browser started (${plan.browser}). Waiting for a login SAP accepts at ${plan.origin} ...\n`,
+      );
+      cookies = await waitForAcceptedCookies(wsUrl, plan.origin);
+    } else {
+      process.stderr.write(
+        `Browser started (${plan.browser}). Complete login for ${plan.origin}, then press Enter to capture cookies.\n`,
+      );
+      await waitForEnter('');
+      cookies = await fetchCookiesViaCdp(wsUrl, plan.origin);
+    }
     if (cookies.length === 0) {
       throw new Error(`No cookies were returned for ${plan.origin}. Ensure you are logged in and try again.`);
     }
